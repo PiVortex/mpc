@@ -1,16 +1,18 @@
 use crate::{
-    app_compose::AppCompose,
+    // app_compose::AppCompose,
     collateral::Collateral,
-    measurements::{ExpectedMeasurements, MeasurementsError},
+    measurements::{FullMeasurements, MeasurementsError},
     quote::QuoteBytes,
     report_data::ReportData,
-    tcb_info::{EventLog, TcbInfo},
+    tcb_info::{EventLog, HexBytes, TcbInfo},
 };
 
 use alloc::{
     format,
     string::{String, ToString},
+    vec::Vec,
 };
+use serde_json::json;
 use borsh::{BorshDeserialize, BorshSerialize};
 use core::fmt;
 use dcap_qvl::verify::VerifiedReport;
@@ -78,6 +80,8 @@ pub enum VerificationError {
         attestation_time: u64,
         expiry_time: u64,
     },
+    #[error("PPID must be 32 bytes, got {0}")]
+    PpidWrongSize(usize),
     #[error("the mock attestation is invalid per definition")]
     InvalidMockAttestation,
     #[error("custom error: `{0}`")]
@@ -109,6 +113,42 @@ impl fmt::Debug for DstackAttestation {
     }
 }
 
+impl Default for DstackAttestation {
+    /// Produces a valid dummy attestation for unit tests (e.g. when `requires_tee = false`).
+    fn default() -> Self {
+        let collateral_json = json!({
+            "tcb_info_issuer_chain": "",
+            "tcb_info": "",
+            "tcb_info_signature": "",
+            "qe_identity_issuer_chain": "",
+            "qe_identity": "",
+            "qe_identity_signature": "",
+            "pck_crl_issuer_chain": "",
+            "root_ca_crl": "",
+            "pck_crl": ""
+        });
+        let collateral =
+            Collateral::try_from_json(collateral_json).expect("default collateral is valid");
+        let tcb_info = TcbInfo {
+            mrtd: HexBytes::default(),
+            rtmr0: HexBytes::default(),
+            rtmr1: HexBytes::default(),
+            rtmr2: HexBytes::default(),
+            rtmr3: HexBytes::default(),
+            os_image_hash: None,
+            compose_hash: HexBytes::default(),
+            device_id: HexBytes::default(),
+            app_compose: String::new(),
+            event_log: Vec::new(),
+        };
+        DstackAttestation::new(
+            QuoteBytes::from(Vec::new()),
+            collateral,
+            tcb_info,
+        )
+    }
+}
+
 impl DstackAttestation {
     /// Checks whether this attestation is valid
     /// with respect to expected values of:
@@ -117,12 +157,16 @@ impl DstackAttestation {
     /// - accepted_measurements: set of accepted RTMRs and key-provider event digest.
     ///   If any element in the set is valid, the function accepts the attestation as
     ///   valid.
+    /// - accepted_ppids: set of accepted PPIDs. PPID in the attestation must match one of the allowed PPIDs.
+    ///
+    /// Returns the `FullMeasurements` that matched and the verified PPID if verification succeeds.
     pub fn verify(
         &self,
         expected_report_data: ReportData,
         timestamp_seconds: u64,
-        accepted_measurements: &[ExpectedMeasurements],
-    ) -> Result<(), VerificationError> {
+        accepted_measurements: &[FullMeasurements],
+        accepted_ppids: &[HexBytes<16>],
+    ) -> Result<(FullMeasurements, HexBytes<16>), VerificationError> {
         let verification_result =
             dcap_qvl::verify::verify(&self.quote, &self.collateral, timestamp_seconds)
                 .map_err(|e| VerificationError::DcapVerification(e.to_string()))?;
@@ -135,11 +179,14 @@ impl DstackAttestation {
         // Verify all attestation components
         self.verify_tcb_status(&verification_result)?;
         self.verify_report_data(&expected_report_data, report_data)?;
+        let ppid = self.verify_ppid(verification_result.ppid, accepted_ppids)?;
 
         self.verify_rtmr3(report_data, &self.tcb_info)?;
         self.verify_app_compose(&self.tcb_info)?;
 
-        self.verify_any_measurements(report_data, &self.tcb_info, accepted_measurements)
+        let measurements =
+            self.verify_any_measurements(report_data, &self.tcb_info, accepted_measurements)?;
+        Ok((measurements, ppid))
     }
 
     /// Replays RTMR3 from the event log by hashing all relevant events together and verifies all
@@ -238,20 +285,42 @@ impl DstackAttestation {
         expected: &ReportData,
         actual: &dcap_qvl::quote::TDReport10,
     ) -> Result<(), VerificationError> {
-        // Check if sha384(tls_public_key) matches the hash in report_data. This check effectively
-        // proves that tls_public_key was included in the quote's report_data by an app running
-        // inside a TDX enclave.
+        // Check the report data from the report matches the expected report data.
         compare_hashes("report_data", &actual.report_data, &expected.to_bytes())
     }
 
-    /// Try to verify static RTMRs and key_provider_digest against multiple expected measurement sets.
-    /// Returns `Ok(())` if any set matches; otherwise, returns a WrongHash error.
+    /// Verifies PPID is in the allowed PPIDs list. Returns the matched PPID on success.
+    fn verify_ppid(
+        &self,
+        ppid: Vec<u8>,
+        accepted_ppids: &[HexBytes<16>],
+    ) -> Result<HexBytes<16>, VerificationError> {
+        // In the future we'll change this to checking device_id inside of PPID
+
+        let ppid_array = match <[u8; 16]>::try_from(ppid.as_slice()) {
+            Ok(array) => array,
+            Err(_) => {
+                return Err(VerificationError::PpidWrongSize(ppid.len()));
+            }
+        };
+        let ppid_hex_bytes = HexBytes::from(ppid_array);
+        if !accepted_ppids.contains(&ppid_hex_bytes) {
+            return Err(VerificationError::Custom(format!(
+                "PPID {} is not in the allowed PPIDs list",
+                hex::encode(ppid_hex_bytes.as_ref())
+            )));
+        }
+        Ok(ppid_hex_bytes)
+    }
+
+    /// Try to verify static RTMRs, key_provider_digest and app_compose_hash against multiple expected measurement sets.
+    /// Returns the matching `ExpectedMeasurements` if any set matches; otherwise, returns a WrongHash error.
     fn verify_any_measurements(
         &self,
         report_data: &dcap_qvl::quote::TDReport10,
         tcb_info: &TcbInfo,
-        accepted_measurements: &[ExpectedMeasurements],
-    ) -> Result<(), VerificationError> {
+        accepted_measurements: &[FullMeasurements],
+    ) -> Result<FullMeasurements, VerificationError> {
         for expected in accepted_measurements {
             if self
                 .verify_static_rtmrs(report_data, tcb_info, expected)
@@ -259,8 +328,11 @@ impl DstackAttestation {
                 && self
                     .verify_key_provider_digest(tcb_info, &expected.key_provider_event_digest)
                     .is_ok()
+                && self
+                    .verify_app_compose_hash(tcb_info, &expected.app_compose_hash_payload)
+                    .is_ok()
             {
-                return Ok(()); // found a valid match
+                return Ok(*expected); // found a valid match
             }
         }
 
@@ -275,7 +347,7 @@ impl DstackAttestation {
         &self,
         report_data: &dcap_qvl::quote::TDReport10,
         tcb_info: &TcbInfo,
-        expected_measurements: &ExpectedMeasurements,
+        expected_measurements: &FullMeasurements,
     ) -> Result<(), VerificationError> {
         // Check if the RTMRs match the expected values. To learn more about RTMRs and
         // their significance, refer to the TDX documentation:
@@ -335,16 +407,16 @@ impl DstackAttestation {
         Self::verify_event_log_rtmr3(&tcb_info.event_log, report_data.rt_mr3)
     }
 
-    /// Verifies app compose configuration and hash. The compose-hash is measured into RTMR3, and
-    /// since it's (roughly) a hash of the unmeasured docker_compose_file, this is sufficient to
-    /// prove its validity.
+    /// Verifies the app compose hash from RTMR3 event matches the one in TCB info.
+    /// and that the app compose hashed in the tcb info matches the hashes provided
     fn verify_app_compose(&self, tcb_info: &TcbInfo) -> Result<(), VerificationError> {
-        let app_compose: AppCompose = serde_json::from_str(&tcb_info.app_compose)
-            .map_err(|e| VerificationError::AppComposeParsing(e.to_string()))?;
+        // Allow any app compose configuration as long as the hash matches (in verify_app_compose_hash)
+        // let app_compose: AppCompose = serde_json::from_str(&tcb_info.app_compose)
+        //     .map_err(|e| VerificationError::AppComposeParsing(e.to_string()))?;
 
-        Self::validate_app_compose_config(&app_compose).or_err(|| {
-            VerificationError::InvalidAppComposeConfig(tcb_info.app_compose.to_string())
-        })?;
+        // Self::validate_app_compose_config(&app_compose).or_err(|| {
+        //     VerificationError::InvalidAppComposeConfig(tcb_info.app_compose.to_string())
+        // })?;
 
         let app_compose_event = tcb_info.get_single_event(COMPOSE_HASH_EVENT)?;
 
@@ -357,19 +429,19 @@ impl DstackAttestation {
         Self::validate_app_compose_payload(&app_compose_event.event_payload, &tcb_info.app_compose)
     }
 
-    /// Validates app compose configuration against expected security requirements.
-    fn validate_app_compose_config(app_compose: &AppCompose) -> bool {
-        app_compose.manifest_version == 2
-            && app_compose.runner == "docker-compose"
-            && !app_compose.kms_enabled
-            && app_compose.gateway_enabled == Some(false)
-            && app_compose.public_logs
-            && app_compose.public_sysinfo
-            && app_compose.local_key_provider_enabled
-            && app_compose.allowed_envs.is_empty()
-            && app_compose.no_instance_id
-            && app_compose.pre_launch_script.is_none()
-    }
+    // /// Validates app compose configuration against expected security requirements.
+    // fn validate_app_compose_config(app_compose: &AppCompose) -> bool {
+    //     app_compose.manifest_version == 2
+    //         && app_compose.runner == "docker-compose"
+    //         && !app_compose.kms_enabled
+    //         && app_compose.gateway_enabled == Some(false)
+    //         && app_compose.public_logs
+    //         && app_compose.public_sysinfo
+    //         && app_compose.local_key_provider_enabled
+    //         && app_compose.allowed_envs.is_empty()
+    //         && app_compose.no_instance_id
+    //         && app_compose.pre_launch_script.is_none()
+    // }
 
     /// Verifies local key-provider event digest matches the expected digest.
     fn verify_key_provider_digest(
@@ -383,6 +455,19 @@ impl DstackAttestation {
             "key_provider",
             key_provider_event.digest.as_slice(),
             expected_digest,
+        )
+    }
+
+    /// Verifies app compose hash in tcb info matches the expected hash in the FullMeasurements.
+    fn verify_app_compose_hash(
+        &self,
+        tcb_info: &TcbInfo,
+        expected_hash_payload: &[u8; 32],
+    ) -> Result<(), VerificationError> {
+        compare_hashes(
+            "app_compose_hash",
+            tcb_info.compose_hash.as_slice(),
+            expected_hash_payload,
         )
     }
 
@@ -455,55 +540,55 @@ impl GetSingleEvent for TcbInfo {
     }
 }
 
-#[cfg(test)]
-#[allow(non_snake_case)]
-mod tests {
-    use super::*;
+// #[cfg(test)]
+// #[allow(non_snake_case)]
+// mod tests {
+//     use super::*;
 
-    use alloc::{string::ToString, vec::Vec};
+//     use alloc::{string::ToString, vec::Vec};
 
-    #[test]
-    fn validate_app_compose_config__succeeds_on_valid_app_compose() {
-        // Given
-        let app_compose = valid_app_compose();
-        // When
-        let result = DstackAttestation::validate_app_compose_config(&app_compose);
+//     #[test]
+//     fn validate_app_compose_config__succeeds_on_valid_app_compose() {
+//         // Given
+//         let app_compose = valid_app_compose();
+//         // When
+//         let result = DstackAttestation::validate_app_compose_config(&app_compose);
 
-        // Then
-        assert!(result)
-    }
+//         // Then
+//         assert!(result)
+//     }
 
-    #[test]
-    fn validate_app_compose_config__allows_insecure_time() {
-        // Given
-        let app_compose = AppCompose {
-            secure_time: Some(false),
-            ..valid_app_compose()
-        };
-        // When
-        let result = DstackAttestation::validate_app_compose_config(&app_compose);
+//     #[test]
+//     fn validate_app_compose_config__allows_insecure_time() {
+//         // Given
+//         let app_compose = AppCompose {
+//             secure_time: Some(false),
+//             ..valid_app_compose()
+//         };
+//         // When
+//         let result = DstackAttestation::validate_app_compose_config(&app_compose);
 
-        // Then
-        assert!(result)
-    }
+//         // Then
+//         assert!(result)
+//     }
 
-    fn valid_app_compose() -> AppCompose {
-        AppCompose {
-            manifest_version: 2,
-            name: "".to_string(),
-            runner: "docker-compose".to_string(),
-            docker_compose_file: "".to_string().into(),
-            kms_enabled: false,
-            tproxy_enabled: None,
-            gateway_enabled: Some(false),
-            public_logs: true,
-            public_sysinfo: true,
-            local_key_provider_enabled: true,
-            key_provider_id: None,
-            allowed_envs: Vec::new(),
-            no_instance_id: true,
-            secure_time: None,
-            pre_launch_script: None,
-        }
-    }
-}
+//     fn valid_app_compose() -> AppCompose {
+//         AppCompose {
+//             manifest_version: 2,
+//             name: "".to_string(),
+//             runner: "docker-compose".to_string(),
+//             docker_compose_file: "".to_string().into(),
+//             kms_enabled: false,
+//             tproxy_enabled: None,
+//             gateway_enabled: Some(false),
+//             public_logs: true,
+//             public_sysinfo: true,
+//             local_key_provider_enabled: true,
+//             key_provider_id: None,
+//             allowed_envs: Vec::new(),
+//             no_instance_id: true,
+//             secure_time: None,
+//             pre_launch_script: None,
+//         }
+//     }
+// }

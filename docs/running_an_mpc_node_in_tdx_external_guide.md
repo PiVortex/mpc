@@ -421,9 +421,9 @@ Run:
 
 ```bash
 docker run --rm \
-  -v "$(pwd)":/dstack-0.5.4 \
+  -v "$(pwd)":/dstack-0.5.5 \
   dstack-mr \
-  measure -c 8 -m 64G /dstack-0.5.4/metadata.json
+  measure -c 1 -m 2G /dstack-0.5.5/metadata.json
 ```
 
 Example output:

@@ -59,6 +59,12 @@ pub struct EventLog {
 #[serde(transparent)]
 pub struct HexBytes<const N: usize>(#[serde_as(as = "Hex")] [u8; N]);
 
+impl<const N: usize> Default for HexBytes<N> {
+    fn default() -> Self {
+        HexBytes([0u8; N])
+    }
+}
+
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HexBytesOrEmpty<const N: usize> {
